@@ -1,6 +1,22 @@
 const api = (path) => `http://localhost:8000${path}`;
 const $ = (id)=>document.getElementById(id);
 
+function toCSV(rows){
+  if(!rows.length) return '';
+  const headers = Object.keys(rows[0]);
+  const head = headers.join(',');
+  const body = rows.map(r => headers.map(h => JSON.stringify(r[h] ?? '')).join(',')).join('\n');
+  return head + '\n' + body;
+}
+function download(name, text){
+  const blob = new Blob([text], {type:'text/csv'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
 function saveIdent(){
   localStorage.setItem('upn', $('upn').value.trim());
   localStorage.setItem('role', $('role').value);
@@ -55,6 +71,50 @@ async function listParts(){
     `;
     body.appendChild(tr);
   });
+}
+
+async function loadStock(){
+  if(!identOk()) return;
+  const u = new URL(api('/stock'));
+  const q = $('dash_search').value.trim();
+  if(q) u.searchParams.set('search', q);
+  const res = await fetch(u, { headers: headers() });
+  if(!res.ok){ const t=await res.text(); return statusMsg(`Stock error: ${t}`,'error'); }
+  const rows = await res.json();
+  const tb = document.querySelector('#stock_tbl tbody');
+  tb.innerHTML = rows.map(r => `
+    <tr>
+      <td>${r.part_no}</td>
+      <td>${r.description}</td>
+      <td>${r.available}</td>
+      <td>${r.location||''}</td>
+    </tr>`).join('');
+  window.__lastStock = rows;
+}
+
+async function loadLedger(){
+  if(!identOk()) return;
+  const u = new URL(api('/ledger'));
+  const a = $('lg_action').value; if(a) u.searchParams.set('action', a);
+  const p = $('lg_part').value.trim(); if(p) u.searchParams.set('part_no', p);
+  const wo = $('lg_wo').value.trim(); if(wo) u.searchParams.set('work_order_no', wo);
+  const s = $('lg_since').value; if(s) u.searchParams.set('since', s);
+  const un = $('lg_until').value; if(un) u.searchParams.set('until', un);
+  const res = await fetch(u, { headers: headers() });
+  if(!res.ok){ const t=await res.text(); return statusMsg(`Ledger error: ${t}`,'error'); }
+  const rows = await res.json();
+  const tb = document.querySelector('#ledger_tbl tbody');
+  tb.innerHTML = rows.map(r => `
+    <tr>
+      <td>${new Date(r.event_time).toLocaleString()}</td>
+      <td>${r.user_upn||''}</td>
+      <td>${r.action}</td>
+      <td>${r.part_no}</td>
+      <td>${r.qty}</td>
+      <td>${r.work_order_no||''}</td>
+      <td>${r.vendor_claim_no||''}</td>
+      <td>${r.prev_qty} → ${r.new_qty}</td>
+    </tr>`).join('');
 }
 
 async function ensureCart(){
@@ -147,15 +207,23 @@ async function checkIn(){
   await listParts();
 }
 
-window.addEventListener('DOMContentLoaded', async ()=>{
+window.onload = async () => {
   loadIdent();
   $('saveIdent').onclick = saveIdent;
-  $('refreshParts').onclick = listParts;
   $('addSelected').onclick = addSelected;
   $('commit').onclick = commitCheckout;
+  $('refreshParts').onclick = listParts;
   $('checkin').onclick = checkIn;
   const clearBtn = document.getElementById('clearCart');
   if (clearBtn) clearBtn.onclick = clearSummary;
+
+  // dashboard
+  const dr = $('dash_refresh'); if(dr) dr.onclick = loadStock;
+  const de = $('dash_export'); if(de) de.onclick = () => download('stock.csv', toCSV(window.__lastStock||[]));
+  const lr = $('lg_refresh'); if(lr) lr.onclick = loadLedger;
+
   await listParts();
   await refreshSummary();
-});
+  await loadStock();
+  await loadLedger();
+};

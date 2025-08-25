@@ -48,6 +48,64 @@ async def parts(search: str = "", session: AsyncSession = Depends(get_session)):
     rows = (await session.execute(text(q), {"s": f"%{search}%"})).mappings().all()
     return list(rows)
 
+# ------- Read-only stock snapshot -------
+@app.get("/stock", dependencies=[Depends(require_role("PartsAdmin","InventoryAdmin"))])
+async def stock(search: str = "", session: AsyncSession = Depends(get_session)):
+    rows = (await session.execute(text("""
+      SELECT pc.part_no, pc.description, COALESCE(i.qty_on_hand,0) AS available, COALESCE(i.location,'') AS location
+      FROM parts_catalog pc
+      LEFT JOIN inventory i ON i.part_no = pc.part_no
+      WHERE pc.active = TRUE
+        AND (pc.part_no ILIKE :s OR pc.description ILIKE :s)
+      ORDER BY pc.part_no ASC
+    """), {"s": f"%{search}%"})).mappings().all()
+    return list(rows)
+
+# ------- Ledger (paged, filtered) -------
+@app.get("/ledger", dependencies=[Depends(require_role("InventoryAdmin","PartsAdmin"))])
+async def ledger(
+    action: str | None = None,        # 'checkout' or 'checkin' or None
+    part_no: str | None = None,
+    work_order_no: str | None = None,
+    since: str | None = None,         # ISO date or datetime
+    until: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    session: AsyncSession = Depends(get_session),
+):
+    where = ["1=1"]
+    params = {}
+    if action:
+        where.append("l.action = :action")
+        params["action"] = action
+    if part_no:
+        where.append("l.part_no ILIKE :p")
+        params["p"] = part_no
+    if work_order_no:
+        where.append("l.work_order_no ILIKE :wo")
+        params["wo"] = work_order_no
+    if since:
+        where.append("l.event_time >= :since")
+        params["since"] = since
+    if until:
+        where.append("l.event_time <= :until")
+        params["until"] = until
+
+    q = f"""
+      SELECT l.event_time, u.upn AS user_upn, l.action, l.part_no, l.qty, l.work_order_no,
+             l.vendor_claim_no, l.prev_qty, l.new_qty
+      FROM ledger l
+      LEFT JOIN users u ON u.id = l.user_id
+      WHERE {' AND '.join(where)}
+      ORDER BY l.event_time DESC
+      LIMIT :limit OFFSET :offset
+    """
+    params["limit"] = max(1, min(limit, 500))
+    params["offset"] = max(0, offset)
+
+    rows = (await session.execute(text(q), params)).mappings().all()
+    return list(rows)
+
 # ------- Cart helpers -------
 @app.post("/cart", dependencies=[Depends(require_role("PartsAdmin","InventoryAdmin"))])
 async def get_or_create_cart(x_user_upn: str | None = Header(None),
