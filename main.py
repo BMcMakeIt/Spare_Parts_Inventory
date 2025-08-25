@@ -107,9 +107,9 @@ async def cart_summary(x_user_upn: str | None = Header(None),
 # ------- Checkout commit (atomic, outbound qty always 1) -------
 @app.post("/checkout/commit", dependencies=[Depends(require_role("PartsAdmin","InventoryAdmin"))])
 async def checkout_commit(
-    request: Request,                                    # non-default first
-    work_order_no: str | None = Query(None),             # accept from query
-    work_order_no_form: str | None = Form(None),         # accept from form
+    request: Request,
+    work_order_no: str | None = Query(None),
+    work_order_no_form: str | None = Form(None),
     x_user_upn: str | None = Header(None),
     session: AsyncSession = Depends(get_session),
 ):
@@ -121,12 +121,7 @@ async def checkout_commit(
         raw_form = await request.form()
     except Exception:
         raw_form = {}
-
-    wo = (work_order_no
-          or work_order_no_form
-          or (raw_form.get("work_order_no") if raw_form else None)
-          or "").strip()
-
+    wo = (work_order_no or work_order_no_form or (raw_form.get("work_order_no") if raw_form else None) or "").strip()
     if not wo:
         raise HTTPException(status_code=422, detail="work_order_no is required")
 
@@ -134,54 +129,58 @@ async def checkout_commit(
     ua = request.headers.get("user-agent","")
 
     async with session.begin():
-        # Ensure the part exists in the catalog
-        await session.execute(text("""
-          INSERT INTO parts_catalog(part_no, description, active)
-          VALUES (:p, 'Uncatalogued', TRUE)
-          ON CONFLICT (part_no) DO NOTHING
-        """), {"p": pn})
-
+        # ensure work order exists
         await session.execute(text("""
           INSERT INTO work_orders(work_order_no) VALUES (:wo)
           ON CONFLICT (work_order_no) DO NOTHING
         """), {"wo": wo})
 
-        row = (await session.execute(text(
-          "SELECT qty_on_hand FROM inventory WHERE part_no=:p FOR UPDATE"
-        ), {"p": pn})).first()
-        if row is None:
+        # get the current user's cart lines
+        lines = (await session.execute(text("""
+          SELECT l.part_no FROM checkout_cart_lines l
+          JOIN checkout_cart c ON c.id = l.cart_id
+          WHERE c.user_id = (SELECT id FROM users WHERE upn=:u)
+          ORDER BY l.part_no ASC
+        """), {"u": x_user_upn})).scalars().all()
+        if not lines:
+            raise HTTPException(400, "Cart is empty")
+
+        for part_no in lines:
+            row = (await session.execute(text(
+                "SELECT qty_on_hand FROM inventory WHERE part_no=:p FOR UPDATE"
+            ), {"p": part_no})).first()
+            prev = row[0] if row else 0
+            if prev < 1:
+                raise HTTPException(status_code=409, detail=f"{part_no} out of stock")
+
+            # decrement stock
             await session.execute(text(
-                "INSERT INTO inventory(part_no, qty_on_hand) VALUES (:p, 0)"
-            ), {"p": pn})
-            prev = 0
-        else:
-            prev = row[0]
+                "UPDATE inventory SET qty_on_hand=qty_on_hand-1, updated_at=now() WHERE part_no=:p"
+            ), {"p": part_no})
 
-        await session.execute(text(
-          "UPDATE inventory SET qty_on_hand=qty_on_hand+1, updated_at=now() WHERE part_no=:p"
-        ), {"p": pn})
+            # transaction & ledger
+            await session.execute(text("""
+              INSERT INTO transactions(type, part_no, qty, work_order_no, user_id)
+              VALUES ('checkout', :p, 1, :wo, (SELECT id FROM users WHERE upn=:u))
+            """), {"p": part_no, "wo": wo, "u": x_user_upn})
 
-        await session.execute(text("""
-          INSERT INTO transactions(type, part_no, qty, work_order_no, vendor_claim_no, user_id)
-          VALUES ('checkin', :p, 1, :wo, :vc, (SELECT id FROM users WHERE upn=:u))
-        """), {"p": pn, "wo": wo, "vc": vc, "u": x_user_upn})
+            await session.execute(text("""
+              INSERT INTO ledger(event_time, user_id, action, part_no, qty, work_order_no, ip, user_agent, prev_qty, new_qty)
+              VALUES (now(), (SELECT id FROM users WHERE upn=:u), 'checkout', :p, 1, :wo, :ip, :ua, :prev, :new)
+            """), {"u": x_user_upn, "p": part_no, "wo": wo, "ip": ip, "ua": ua, "prev": prev, "new": prev-1})
 
-        await session.execute(text("""
-          INSERT INTO ledger(event_time, user_id, action, part_no, qty, work_order_no, vendor_claim_no, ip, user_agent, prev_qty, new_qty)
-          VALUES (now(), (SELECT id FROM users WHERE upn=:u), 'checkin', :p, 1, :wo, :vc, :ip, :ua, :prev, :new)
-        """), {"u": x_user_upn, "p": pn, "wo": wo, "vc": vc, "ip": ip, "ua": ua, "prev": prev, "new": prev+1})
-
-
+        # clear the cart
         await session.execute(text("""
           DELETE FROM checkout_cart_lines
           WHERE cart_id IN (SELECT id FROM checkout_cart WHERE user_id=(SELECT id FROM users WHERE upn=:u))
         """), {"u": x_user_upn})
+
     return {"ok": True, "work_order_no": wo}
 
 # ------- Receiving (check-in) -------
 @app.post("/checkin", dependencies=[Depends(require_role("PartsAdmin","InventoryAdmin"))])
 async def checkin(
-    request: Request,                                  # non-default first
+    request: Request,
     part_no: str | None = Query(None),
     work_order_no: str | None = Query(None),
     vendor_claim_no: str | None = Query(None),
@@ -211,19 +210,20 @@ async def checkin(
         raise HTTPException(status_code=422, detail="part_no, work_order_no, vendor_claim_no are required")
 
     async with session.begin():
-    # Ensure the part exists in the catalog
-    await session.execute(text("""
-      INSERT INTO parts_catalog(part_no, description, active)
-      VALUES (:p, 'Uncatalogued', TRUE)
-      ON CONFLICT (part_no) DO NOTHING
-    """), {"p": pn})
+        # ensure the part exists in the catalog (seamless first-time check-in)
+        await session.execute(text("""
+          INSERT INTO parts_catalog(part_no, description, active)
+          VALUES (:p, 'Uncatalogued', TRUE)
+          ON CONFLICT (part_no) DO NOTHING
+        """), {"p": pn})
 
-    await session.execute(text("""
-      INSERT INTO work_orders(work_order_no) VALUES (:wo)
-      ON CONFLICT (work_order_no) DO NOTHING
-    """), {"wo": wo})
+        # ensure the work order exists
+        await session.execute(text("""
+          INSERT INTO work_orders(work_order_no) VALUES (:wo)
+          ON CONFLICT (work_order_no) DO NOTHING
+        """), {"wo": wo})
 
-
+        # lock + increment inventory
         row = (await session.execute(text(
           "SELECT qty_on_hand FROM inventory WHERE part_no=:p FOR UPDATE"
         ), {"p": pn})).first()
@@ -239,6 +239,7 @@ async def checkin(
           "UPDATE inventory SET qty_on_hand=qty_on_hand+1, updated_at=now() WHERE part_no=:p"
         ), {"p": pn})
 
+        # transaction & ledger
         await session.execute(text("""
           INSERT INTO transactions(type, part_no, qty, work_order_no, vendor_claim_no, user_id)
           VALUES ('checkin', :p, 1, :wo, :vc, (SELECT id FROM users WHERE upn=:u))
