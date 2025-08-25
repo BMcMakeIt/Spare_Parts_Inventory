@@ -1,0 +1,95 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Inventory — Issue / Receive</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body{font-family:Segoe UI,Arial,sans-serif;margin:0;background:#0f1216;color:#e8e8e8}
+    header{position:sticky;top:0;background:#11171d;border-bottom:1px solid #222;padding:10px 16px;z-index:10}
+    .bar{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+    input,button,select{background:#141a21;border:1px solid #2a2f36;border-radius:6px;color:#e8e8e8;padding:8px}
+    button{cursor:pointer}
+    main{display:grid;grid-template-columns:1fr 320px;gap:16px;padding:16px}
+    .card{background:#11171d;border:1px solid #222;border-radius:12px;padding:12px}
+    table{width:100%;border-collapse:collapse}
+    th,td{border-bottom:1px solid #222;padding:8px;text-align:left}
+    th{position:sticky;top:52px;background:#11171d;z-index:5}
+    .sticky-footer{position:sticky;bottom:0;background:#11171d;border-top:1px solid #222;padding:10px;display:flex;gap:8px;justify-content:space-between}
+    .muted{color:#98a2ad;font-size:12px}
+    .success{color:#9ae6b4}
+    .error{color:#f6ad55}
+    .tag{font-size:12px;padding:2px 6px;border:1px solid #2a2f36;border-radius:999px}
+  </style>
+</head>
+<body>
+  <header>
+    <div class="bar">
+      <strong>Inventory</strong>
+      <span class="muted">Standalone • Qty out/in always 1 • Append-only ledger</span>
+      <span style="flex:1"></span>
+      <label> User (UPN):
+        <input id="upn" placeholder="admin@example.com" style="width:220px">
+      </label>
+      <label> Role:
+        <select id="role">
+          <option>PartsAdmin</option>
+          <option>InventoryAdmin</option>
+        </select>
+      </label>
+      <button id="saveIdent">Save</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="card">
+      <div class="bar" style="margin-bottom:8px">
+        <input id="search" placeholder="Search parts..." style="flex:1">
+        <button id="refreshParts">Refresh</button>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th style="width:80px">Select</th>
+            <th>Part No</th>
+            <th>Description</th>
+            <th>Available</th>
+            <th>Location</th>
+          </tr>
+        </thead>
+        <tbody id="partsBody"></tbody>
+      </table>
+
+      <div class="sticky-footer">
+        <div>
+          <label> Work Order:
+            <input id="wo" placeholder="WO-1001" style="width:160px">
+          </label>
+          <span class="muted">Selected parts will be issued with qty = 1 each</span>
+        </div>
+        <div>
+          <button id="addSelected">Add Selected</button>
+          <button id="commit">Next stage → Complete</button>
+        </div>
+      </div>
+    </section>
+
+    <aside class="card">
+      <h3>Summary</h3>
+      <div id="summaryList" class="muted">None selected.</div>
+      <hr>
+      <h3>Receive (Check In)</h3>
+      <div class="bar" style="flex-direction:column;align-items:flex-start">
+        <label>Part No <input id="in_part" placeholder="A100"></label>
+        <label>Work Order <input id="in_wo" placeholder="WO-1001"></label>
+        <label>Vendor Claim <input id="in_claim" placeholder="VC-123"></label>
+        <button id="checkin">Check part in</button>
+      </div>
+      <hr>
+      <div id="status" class="muted"></div>
+    </aside>
+  </main>
+
+  <script src="./app.js?v=4"></script>
+</body>
+</html>
