@@ -104,6 +104,23 @@ async def cart_summary(x_user_upn: str | None = Header(None),
     """), {"u": x_user_upn})).mappings().all()
     return list(rows)
 
+@app.delete("/cart/clear", dependencies=[Depends(require_role("PartsAdmin","InventoryAdmin"))])
+async def cart_clear(
+    x_user_upn: str | None = Header(None),
+    session: AsyncSession = Depends(get_session),
+):
+    if not x_user_upn:
+        raise HTTPException(401, "Missing user")
+    async with session.begin():
+        await session.execute(text("""
+          DELETE FROM checkout_cart_lines
+          WHERE cart_id IN (
+            SELECT id FROM checkout_cart
+            WHERE user_id = (SELECT id FROM users WHERE upn=:u)
+          )
+        """), {"u": x_user_upn})
+    return {"ok": True}
+
 # ------- Checkout commit (atomic, outbound qty always 1) -------
 @app.post("/checkout/commit", dependencies=[Depends(require_role("PartsAdmin","InventoryAdmin"))])
 async def checkout_commit(
