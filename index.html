@@ -20,6 +20,8 @@
     .success{color:#9ae6b4}
     .error{color:#f6ad55}
     .tag{font-size:12px;padding:2px 6px;border:1px solid #2a2f36;border-radius:999px}
+    .row{display:flex;gap:16px;flex-wrap:wrap}
+    .filters{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px}
   </style>
 </head>
 <body>
@@ -92,6 +94,51 @@
     </aside>
   </main>
 
-  <script src="./app.js?v=7"></script>
+  <hr/>
+  <h2>Dashboard</h2>
+  <div class="row">
+    <div class="card">
+      <h3>Stock</h3>
+      <div>
+        <input id="dash_search" placeholder="Search parts..." />
+        <button id="dash_refresh" class="btn">Refresh</button>
+        <button id="dash_export" class="btn small">Export CSV</button>
+      </div>
+      <table id="stock_tbl">
+        <thead><tr><th>Part No</th><th>Description</th><th>Available</th><th>Location</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h3>Ledger</h3>
+      <div class="filters">
+        <label>Action
+          <select id="lg_action">
+            <option value="">Any</option>
+            <option value="checkout">Checkout</option>
+            <option value="checkin">Checkin</option>
+          </select>
+        </label>
+        <input id="lg_part" placeholder="Part no" />
+        <input id="lg_wo" placeholder="Work order" />
+        <input id="lg_since" type="datetime-local" />
+        <input id="lg_until" type="datetime-local" />
+        <button id="lg_refresh" class="btn">Refresh</button>
+      </div>
+      <table id="ledger_tbl">
+        <thead>
+          <tr>
+            <th>When</th><th>User</th><th>Action</th><th>Part</th><th>Qty</th>
+            <th>Work Order</th><th>Vendor Claim</th><th>Prev→New</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- bump script to bust cache -->
+  <script src="./app.js?v=8"></script>
 </body>
 </html>
