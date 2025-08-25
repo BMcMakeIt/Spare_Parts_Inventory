@@ -83,10 +83,11 @@ async function addSelected(){
 
 async function refreshSummary(){
   const res = await fetch(api('/cart/summary'), { headers: headers() });
-  if(!res.ok){ $('summaryList').textContent = 'None selected.'; return; }
-  const data = await res.json();
-  if(!data.length){ $('summaryList').textContent = 'None selected.'; return; }
-  $('summaryList').innerHTML = data.map(d=>`• ${d.part_no} (qty 1)`).join('<br>');
+  if(!res.ok){ $('summary').textContent = 'None selected.'; $('commit').disabled = true; return; }
+  const lines = await res.json();
+  $('commit').disabled = (lines.length === 0);
+  if(!lines.length){ $('summary').textContent = 'None selected.'; return; }
+  $('summary').innerHTML = lines.map(d=>`• ${d.part_no} (qty 1)`).join('<br>');
 }
 
 async function commitCheckout(){
@@ -113,6 +114,20 @@ async function commitCheckout(){
   }
 }
 
+async function clearSummary(){
+  if(!identOk()) return;
+  try{
+    const res = await fetch(api('/cart/clear'), { method:'DELETE', headers: headers() });
+    if(!res.ok){
+      const txt = await res.text();
+      return statusMsg(`Clear failed: ${txt}`, 'error');
+    }
+    statusMsg('Cleared cart','success');
+    await refreshSummary();
+  }catch(e){
+    statusMsg(e.message, 'error');
+  }
+}
 
 async function checkIn(){
   const p = $('in_part').value.trim();
@@ -139,6 +154,8 @@ window.addEventListener('DOMContentLoaded', async ()=>{
   $('addSelected').onclick = addSelected;
   $('commit').onclick = commitCheckout;
   $('checkin').onclick = checkIn;
+  const clearBtn = document.getElementById('clearCart');
+  if (clearBtn) clearBtn.onclick = clearSummary;
   await listParts();
   await refreshSummary();
 });
