@@ -1,0 +1,253 @@
+import os
+from fastapi import FastAPI, Depends, Header, HTTPException, Request
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import RedirectResponse
+from fastapi import Form, Query
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy import text
+
+DB_URL = os.environ["DB_URL"]
+engine = create_async_engine(DB_URL, pool_pre_ping=True)
+Session = async_sessionmaker(engine, expire_on_commit=False)
+
+app = FastAPI(title="Inventory API")
+
+# Serve UI at /ui and redirect / -> /ui/
+app.mount("/ui", StaticFiles(directory="static", html=True), name="static")
+
+@app.get("/")
+async def root():
+    return RedirectResponse(url="/ui/")
+
+# --- simple RBAC via headers for now ---
+def require_role(*allowed):
+    async def _dep(x_user_role: str | None = Header(None)):
+        if x_user_role is None or x_user_role not in allowed:
+            raise HTTPException(status_code=403, detail="Forbidden")
+    return _dep
+
+async def get_session() -> AsyncSession:
+    async with Session() as s:
+        yield s
+
+@app.get("/health")
+async def health():
+    return {"ok": True}
+
+# ------- Parts listing (alphanumeric sorted one row per part) -------
+@app.get("/parts")
+async def parts(search: str = "", session: AsyncSession = Depends(get_session)):
+    q = """
+    SELECT pc.part_no, pc.description, COALESCE(i.qty_on_hand,0) AS available, COALESCE(i.location,'') AS location
+    FROM parts_catalog pc
+    LEFT JOIN inventory i ON i.part_no = pc.part_no
+    WHERE pc.active = TRUE
+      AND (pc.part_no ILIKE :s OR pc.description ILIKE :s)
+    ORDER BY pc.part_no ASC
+    """
+    rows = (await session.execute(text(q), {"s": f"%{search}%"})).mappings().all()
+    return list(rows)
+
+# ------- Cart helpers -------
+@app.post("/cart", dependencies=[Depends(require_role("PartsAdmin","InventoryAdmin"))])
+async def get_or_create_cart(x_user_upn: str | None = Header(None),
+                             session: AsyncSession = Depends(get_session)):
+    if not x_user_upn: raise HTTPException(401, "Missing user")
+    await session.execute(text("""
+        INSERT INTO users(upn, role_id)
+        VALUES (:u,(SELECT id FROM roles WHERE name='PartsAdmin'))
+        ON CONFLICT (upn) DO NOTHING
+    """), {"u": x_user_upn})
+    res = await session.execute(text("""
+        SELECT id FROM checkout_cart WHERE user_id=(SELECT id FROM users WHERE upn=:u)
+        ORDER BY created_at DESC LIMIT 1
+    """), {"u": x_user_upn})
+    row = res.first()
+    if row:
+        await session.commit()
+        return {"cart_id": row[0]}
+    new = await session.execute(text("""
+        INSERT INTO checkout_cart(user_id)
+        VALUES ((SELECT id FROM users WHERE upn=:u)) RETURNING id
+    """), {"u": x_user_upn})
+    cid = new.first()[0]
+    await session.commit()
+    return {"cart_id": cid}
+
+@app.post("/cart/lines", dependencies=[Depends(require_role("PartsAdmin","InventoryAdmin"))])
+async def add_line(part_no: str,
+                   x_user_upn: str | None = Header(None),
+                   session: AsyncSession = Depends(get_session)):
+    if not x_user_upn: raise HTTPException(401, "Missing user")
+    async with session.begin():
+        cart = await session.execute(text("""
+          SELECT id FROM checkout_cart WHERE user_id=(SELECT id FROM users WHERE upn=:u)
+          ORDER BY created_at DESC LIMIT 1
+        """), {"u": x_user_upn})
+        c = cart.first()
+        if not c: raise HTTPException(400, "Cart not found; create /cart")
+        await session.execute(text("""
+          INSERT INTO checkout_cart_lines(cart_id, part_no, qty) VALUES (:c, :p, 1)
+        """), {"c": c[0], "p": part_no})
+    return {"ok": True}
+
+@app.get("/cart/summary", dependencies=[Depends(require_role("PartsAdmin","InventoryAdmin"))])
+async def cart_summary(x_user_upn: str | None = Header(None),
+                       session: AsyncSession = Depends(get_session)):
+    if not x_user_upn: raise HTTPException(401, "Missing user")
+    rows = (await session.execute(text("""
+      SELECT l.part_no, 1 AS qty
+      FROM checkout_cart_lines l
+      JOIN checkout_cart c ON c.id = l.cart_id
+      WHERE c.user_id = (SELECT id FROM users WHERE upn=:u)
+      ORDER BY l.part_no ASC
+    """), {"u": x_user_upn})).mappings().all()
+    return list(rows)
+
+# ------- Checkout commit (atomic, outbound qty always 1) -------
+@app.post("/checkout/commit", dependencies=[Depends(require_role("PartsAdmin","InventoryAdmin"))])
+async def checkout_commit(
+    request: Request,                                    # non-default first
+    work_order_no: str | None = Query(None),             # accept from query
+    work_order_no_form: str | None = Form(None),         # accept from form
+    x_user_upn: str | None = Header(None),
+    session: AsyncSession = Depends(get_session),
+):
+    if not x_user_upn:
+        raise HTTPException(401, "Missing user")
+
+    # Accept WO from query OR form, with a raw-form fallback
+    try:
+        raw_form = await request.form()
+    except Exception:
+        raw_form = {}
+
+    wo = (work_order_no
+          or work_order_no_form
+          or (raw_form.get("work_order_no") if raw_form else None)
+          or "").strip()
+
+    if not wo:
+        raise HTTPException(status_code=422, detail="work_order_no is required")
+
+    ip = request.client.host if request.client else None
+    ua = request.headers.get("user-agent","")
+
+    async with session.begin():
+        # Ensure the part exists in the catalog
+        await session.execute(text("""
+          INSERT INTO parts_catalog(part_no, description, active)
+          VALUES (:p, 'Uncatalogued', TRUE)
+          ON CONFLICT (part_no) DO NOTHING
+        """), {"p": pn})
+
+        await session.execute(text("""
+          INSERT INTO work_orders(work_order_no) VALUES (:wo)
+          ON CONFLICT (work_order_no) DO NOTHING
+        """), {"wo": wo})
+
+        row = (await session.execute(text(
+          "SELECT qty_on_hand FROM inventory WHERE part_no=:p FOR UPDATE"
+        ), {"p": pn})).first()
+        if row is None:
+            await session.execute(text(
+                "INSERT INTO inventory(part_no, qty_on_hand) VALUES (:p, 0)"
+            ), {"p": pn})
+            prev = 0
+        else:
+            prev = row[0]
+
+        await session.execute(text(
+          "UPDATE inventory SET qty_on_hand=qty_on_hand+1, updated_at=now() WHERE part_no=:p"
+        ), {"p": pn})
+
+        await session.execute(text("""
+          INSERT INTO transactions(type, part_no, qty, work_order_no, vendor_claim_no, user_id)
+          VALUES ('checkin', :p, 1, :wo, :vc, (SELECT id FROM users WHERE upn=:u))
+        """), {"p": pn, "wo": wo, "vc": vc, "u": x_user_upn})
+
+        await session.execute(text("""
+          INSERT INTO ledger(event_time, user_id, action, part_no, qty, work_order_no, vendor_claim_no, ip, user_agent, prev_qty, new_qty)
+          VALUES (now(), (SELECT id FROM users WHERE upn=:u), 'checkin', :p, 1, :wo, :vc, :ip, :ua, :prev, :new)
+        """), {"u": x_user_upn, "p": pn, "wo": wo, "vc": vc, "ip": ip, "ua": ua, "prev": prev, "new": prev+1})
+
+
+        await session.execute(text("""
+          DELETE FROM checkout_cart_lines
+          WHERE cart_id IN (SELECT id FROM checkout_cart WHERE user_id=(SELECT id FROM users WHERE upn=:u))
+        """), {"u": x_user_upn})
+    return {"ok": True, "work_order_no": wo}
+
+# ------- Receiving (check-in) -------
+@app.post("/checkin", dependencies=[Depends(require_role("PartsAdmin","InventoryAdmin"))])
+async def checkin(
+    request: Request,                                  # non-default first
+    part_no: str | None = Query(None),
+    work_order_no: str | None = Query(None),
+    vendor_claim_no: str | None = Query(None),
+    part_no_form: str | None = Form(None),
+    work_order_no_form: str | None = Form(None),
+    vendor_claim_no_form: str | None = Form(None),
+    x_user_upn: str | None = Header(None),
+    session: AsyncSession = Depends(get_session),
+):
+    if not x_user_upn:
+        raise HTTPException(401, "Missing user")
+
+    ip = request.client.host if request.client else None
+    ua = request.headers.get("user-agent","")
+
+    # Accept from query OR form; also try raw form for maximum compatibility
+    try:
+        raw_form = await request.form()
+    except Exception:
+        raw_form = {}
+
+    pn = (part_no or part_no_form or (raw_form.get("part_no") if raw_form else None) or "").strip()
+    wo = (work_order_no or work_order_no_form or (raw_form.get("work_order_no") if raw_form else None) or "").strip()
+    vc = (vendor_claim_no or vendor_claim_no_form or (raw_form.get("vendor_claim_no") if raw_form else None) or "").strip()
+
+    if not pn or not wo or not vc:
+        raise HTTPException(status_code=422, detail="part_no, work_order_no, vendor_claim_no are required")
+
+    async with session.begin():
+    # Ensure the part exists in the catalog
+    await session.execute(text("""
+      INSERT INTO parts_catalog(part_no, description, active)
+      VALUES (:p, 'Uncatalogued', TRUE)
+      ON CONFLICT (part_no) DO NOTHING
+    """), {"p": pn})
+
+    await session.execute(text("""
+      INSERT INTO work_orders(work_order_no) VALUES (:wo)
+      ON CONFLICT (work_order_no) DO NOTHING
+    """), {"wo": wo})
+
+
+        row = (await session.execute(text(
+          "SELECT qty_on_hand FROM inventory WHERE part_no=:p FOR UPDATE"
+        ), {"p": pn})).first()
+        if row is None:
+            await session.execute(text(
+                "INSERT INTO inventory(part_no, qty_on_hand) VALUES (:p, 0)"
+            ), {"p": pn})
+            prev = 0
+        else:
+            prev = row[0]
+
+        await session.execute(text(
+          "UPDATE inventory SET qty_on_hand=qty_on_hand+1, updated_at=now() WHERE part_no=:p"
+        ), {"p": pn})
+
+        await session.execute(text("""
+          INSERT INTO transactions(type, part_no, qty, work_order_no, vendor_claim_no, user_id)
+          VALUES ('checkin', :p, 1, :wo, :vc, (SELECT id FROM users WHERE upn=:u))
+        """), {"p": pn, "wo": wo, "vc": vc, "u": x_user_upn})
+
+        await session.execute(text("""
+          INSERT INTO ledger(event_time, user_id, action, part_no, qty, work_order_no, vendor_claim_no, ip, user_agent, prev_qty, new_qty)
+          VALUES (now(), (SELECT id FROM users WHERE upn=:u), 'checkin', :p, 1, :wo, :vc, :ip, :ua, :prev, :new)
+        """), {"u": x_user_upn, "p": pn, "wo": wo, "vc": vc, "ip": ip, "ua": ua, "prev": prev, "new": prev+1})
+
+    return {"ok": True}
+
