@@ -16,14 +16,14 @@ app = FastAPI(title="Inventory API")
 BASE_DIR = os.path.dirname(__file__)
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 
-# Serve UI at /ui and redirect / -> /ui/
+# Serve UI at /ui and redirect / -> /ui
 app.mount("/ui", StaticFiles(directory=STATIC_DIR, html=True), name="ui")
 # If your HTML references /static/... assets, also expose this:
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 @app.get("/")
 async def root():
-    return RedirectResponse(url="/ui/")
+    return RedirectResponse(url="/ui")
 
 # --- simple RBAC via headers for now ---
 def require_role(*allowed):
