@@ -112,8 +112,8 @@ async def get_or_create_cart(x_user_upn: str | None = Header(None),
                              session: AsyncSession = Depends(get_session)):
     if not x_user_upn: raise HTTPException(401, "Missing user")
     await session.execute(text("""
-        INSERT INTO users(upn, role_id)
-        VALUES (:u,(SELECT id FROM roles WHERE name='PartsAdmin'))
+        INSERT INTO users(upn)
+        VALUES (:u)
         ON CONFLICT (upn) DO NOTHING
     """), {"u": x_user_upn})
     res = await session.execute(text("""
